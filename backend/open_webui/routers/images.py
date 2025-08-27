@@ -8,20 +8,12 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from urllib.parse import quote
 import requests
-from fastapi import (
-    APIRouter,
-    Depends,
-    HTTPException,
-    Request,
-    UploadFile,
-)
-
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from open_webui.config import CACHE_DIR
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import ENABLE_FORWARD_USER_INFO_HEADERS, SRC_LOG_LEVELS
-from open_webui.routers.files import upload_file_handler
+from open_webui.routers.files import upload_file
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.images.comfyui import (
     ComfyUIGenerateImageForm,
@@ -310,16 +302,8 @@ async def update_image_config(
 ):
     set_image_model(request, form_data.MODEL)
 
-    if form_data.IMAGE_SIZE == "auto" and form_data.MODEL != "gpt-image-1":
-        raise HTTPException(
-            status_code=400,
-            detail=ERROR_MESSAGES.INCORRECT_FORMAT(
-                "  (auto is only allowed with gpt-image-1)."
-            ),
-        )
-
     pattern = r"^\d+x\d+$"
-    if form_data.IMAGE_SIZE == "auto" or re.match(pattern, form_data.IMAGE_SIZE):
+    if re.match(pattern, form_data.IMAGE_SIZE):
         request.app.state.config.IMAGE_SIZE = form_data.IMAGE_SIZE
     else:
         raise HTTPException(
@@ -349,11 +333,10 @@ def get_models(request: Request, user=Depends(get_verified_user)):
             return [
                 {"id": "dall-e-2", "name": "DALL·E 2"},
                 {"id": "dall-e-3", "name": "DALL·E 3"},
-                {"id": "gpt-image-1", "name": "GPT-IMAGE 1"},
             ]
         elif request.app.state.config.IMAGE_GENERATION_ENGINE == "gemini":
             return [
-                {"id": "imagen-3.0-generate-002", "name": "imagen-3.0 generate-002"},
+                {"id": "imagen-3-0-generate-002", "name": "imagen-3.0 generate-002"},
             ]
         elif request.app.state.config.IMAGE_GENERATION_ENGINE == "comfyui":
             # TODO - get models from comfyui
@@ -436,7 +419,7 @@ def load_b64_image_data(b64_str):
     try:
         if "," in b64_str:
             header, encoded = b64_str.split(",", 1)
-            mime_type = header.split(";")[0].lstrip("data:")
+            mime_type = header.split(";")[0]
             img_data = base64.b64decode(encoded)
         else:
             mime_type = "image/png"
@@ -444,7 +427,7 @@ def load_b64_image_data(b64_str):
         return img_data, mime_type
     except Exception as e:
         log.exception(f"Error loading image data: {e}")
-        return None, None
+        return None
 
 
 def load_url_image_data(url, headers=None):
@@ -467,7 +450,7 @@ def load_url_image_data(url, headers=None):
         return None
 
 
-def upload_image(request, image_data, content_type, metadata, user):
+def upload_image(request, image_metadata, image_data, content_type, user):
     image_format = mimetypes.guess_extension(content_type)
     file = UploadFile(
         file=io.BytesIO(image_data),
@@ -476,13 +459,7 @@ def upload_image(request, image_data, content_type, metadata, user):
             "content-type": content_type,
         },
     )
-    file_item = upload_file_handler(
-        request,
-        file=file,
-        metadata=metadata,
-        process=False,
-        user=user,
-    )
+    file_item = upload_file(request, file, user, file_metadata=image_metadata)
     url = request.app.url_path_for("get_file_content_by_id", id=file_item.id)
     return url
 
@@ -493,21 +470,7 @@ async def image_generations(
     form_data: GenerateImageForm,
     user=Depends(get_verified_user),
 ):
-    # if IMAGE_SIZE = 'auto', default WidthxHeight to the 512x512 default
-    # This is only relevant when the user has set IMAGE_SIZE to 'auto' with an
-    # image model other than gpt-image-1, which is warned about on settings save
-
-    size = "512x512"
-    if (
-        request.app.state.config.IMAGE_SIZE
-        and "x" in request.app.state.config.IMAGE_SIZE
-    ):
-        size = request.app.state.config.IMAGE_SIZE
-
-    if form_data.size and "x" in form_data.size:
-        size = form_data.size
-
-    width, height = tuple(map(int, size.split("x")))
+    width, height = tuple(map(int, request.app.state.config.IMAGE_SIZE.split("x")))
 
     r = None
     try:
@@ -519,7 +482,7 @@ async def image_generations(
             headers["Content-Type"] = "application/json"
 
             if ENABLE_FORWARD_USER_INFO_HEADERS:
-                headers["X-OpenWebUI-User-Name"] = quote(user.name, safe=" ")
+                headers["X-OpenWebUI-User-Name"] = user.name
                 headers["X-OpenWebUI-User-Id"] = user.id
                 headers["X-OpenWebUI-User-Email"] = user.email
                 headers["X-OpenWebUI-User-Role"] = user.role
@@ -537,11 +500,7 @@ async def image_generations(
                     if form_data.size
                     else request.app.state.config.IMAGE_SIZE
                 ),
-                **(
-                    {}
-                    if "gpt-image-1" in request.app.state.config.IMAGE_GENERATION_MODEL
-                    else {"response_format": "b64_json"}
-                ),
+                "response_format": "b64_json",
             }
 
             # Use asyncio.to_thread for the requests.post call
@@ -563,7 +522,7 @@ async def image_generations(
                 else:
                     image_data, content_type = load_b64_image_data(image["b64_json"])
 
-                url = upload_image(request, image_data, content_type, data, user)
+                url = upload_image(request, data, image_data, content_type, user)
                 images.append({"url": url})
             return images
 
@@ -597,7 +556,7 @@ async def image_generations(
                 image_data, content_type = load_b64_image_data(
                     image["bytesBase64Encoded"]
                 )
-                url = upload_image(request, image_data, content_type, data, user)
+                url = upload_image(request, data, image_data, content_type, user)
                 images.append({"url": url})
 
             return images
@@ -648,9 +607,9 @@ async def image_generations(
                 image_data, content_type = load_url_image_data(image["url"], headers)
                 url = upload_image(
                     request,
+                    form_data.model_dump(exclude_none=True),
                     image_data,
                     content_type,
-                    form_data.model_dump(exclude_none=True),
                     user,
                 )
                 images.append({"url": url})
@@ -660,7 +619,7 @@ async def image_generations(
             or request.app.state.config.IMAGE_GENERATION_ENGINE == ""
         ):
             if form_data.model:
-                set_image_model(request, form_data.model)
+                set_image_model(form_data.model)
 
             data = {
                 "prompt": form_data.prompt,
@@ -701,9 +660,9 @@ async def image_generations(
                 image_data, content_type = load_b64_image_data(image)
                 url = upload_image(
                     request,
+                    {**data, "info": res["info"]},
                     image_data,
                     content_type,
-                    {**data, "info": res["info"]},
                     user,
                 )
                 images.append({"url": url})
